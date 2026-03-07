@@ -9,20 +9,14 @@ import { EquicordDevs } from "@utils/constants";
 import definePlugin, { OptionType } from "@utils/types";
 import { ChannelStore, ComponentDispatch, DraftType, Forms, PermissionsBits, PermissionStore, showToast, Toasts, UploadHandler, UserStore } from "@webpack/common";
 
-import { latexToExpr } from "./latex";
-import { createEvaluationState, evaluateExpressionWithOutputs } from "./parser";
-import { canvasToBlob, renderMathToCanvas } from "./renderer";
+import { createEvaluationState, evaluateDetachedExpression, evaluateExpressionWithOutputs, sampleGraphExpression } from "./parser";
+import { canvasToBlob, getGraphColor, type GraphSeries, renderGraphToCanvas, renderMathToCanvas } from "./renderer";
 import { tryConvertUnits } from "./units";
 
 const settings = definePluginSettings({
     showSteps: {
         type: OptionType.BOOLEAN,
         description: "Show step-by-step decomposition of calculations.",
-        default: false
-    },
-    latexInput: {
-        type: OptionType.BOOLEAN,
-        description: "Support LaTeX notation in expressions (e.g. \\frac{a}{b}, \\sqrt{x}).",
         default: false
     },
     imageOutput: {
@@ -48,7 +42,78 @@ const settings = definePluginSettings({
 });
 
 function resolveExpr(raw: string): string {
-    return settings.store.latexInput ? latexToExpr(raw) : raw;
+    return raw;
+}
+
+function splitTopLevelArgs(input: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let start = 0;
+
+    for (let i = 0; i < input.length; i++) {
+        const char = input[i];
+        if (char === "(") depth++;
+        else if (char === ")") depth--;
+        else if (char === "," && depth === 0) {
+            parts.push(input.slice(start, i).trim());
+            start = i + 1;
+        }
+    }
+
+    parts.push(input.slice(start).trim());
+    return parts;
+}
+
+function getGraphCall(raw: string): { expression: string; domain?: readonly [string, string]; } | null {
+    const trimmed = raw.trim();
+    if (!trimmed.toLowerCase().startsWith("graph(") || !trimmed.endsWith(")")) return null;
+
+    let depth = 0;
+    for (let i = 5; i < trimmed.length; i++) {
+        const char = trimmed[i];
+        if (char === "(") depth++;
+        if (char === ")") depth--;
+        if (depth === 0 && i !== trimmed.length - 1) return null;
+    }
+
+    if (depth !== 0) return null;
+
+    const inner = trimmed.slice(6, -1).trim();
+    if (!inner) return null;
+
+    const args = splitTopLevelArgs(inner);
+    if (args.length === 1) return { expression: args[0] };
+    if (args.length !== 3 || args.some(arg => !arg)) return null;
+
+    return {
+        expression: args[0],
+        domain: [args[1], args[2]],
+    };
+}
+
+function resolveGraphDomain(domain: readonly [string, string] | undefined, state: ReturnType<typeof createEvaluationState>): readonly [number, number] {
+    if (!domain) return [-10, 10];
+
+    const [minExpr, maxExpr] = domain;
+    const min = evaluateDetachedExpression(resolveExpr(minExpr), state);
+    const max = evaluateDetachedExpression(resolveExpr(maxExpr), state);
+    if (min.statementKind !== "expr_stmt" || max.statementKind !== "expr_stmt")
+        throw new Error("Graph domain must be expressions");
+
+    return [min.result, max.result];
+}
+
+function resolveCombinedGraphDomain(domains: readonly (readonly [number, number])[]): readonly [number, number] {
+    if (!domains.length) return [-10, 10];
+
+    let min = domains[0][0];
+    let max = domains[0][1];
+    for (const [domainMin, domainMax] of domains) {
+        if (domainMin < min) min = domainMin;
+        if (domainMax > max) max = domainMax;
+    }
+
+    return [min, max];
 }
 
 function canUploadInChannel(channelId: string) {
@@ -69,7 +134,7 @@ export default definePlugin({
     name: "InlineMath",
     description: "Evaluate inline {math expressions} in messages.",
     authors: [EquicordDevs.ape],
-    tags: ["math", "calculate", "calculator", "latex"],
+    tags: ["math", "calculate", "calculator"],
     settings,
 
     settingsAboutComponent: () => (
@@ -96,14 +161,17 @@ export default definePlugin({
 
         // Collect expressions for potential image rendering
         const exprs: { raw: string; detailed?: string; simple: string; }[] = [];
+        const graphs: GraphSeries[] = [];
+        const graphDomains: [number, number][] = [];
         const matches = Array.from(msg.content.matchAll(/\{([^{}]+)\}/g));
         if (matches.length === 0) return;
+        const hasGraphCall = matches.some(match => getGraphCall(match[1]) != null);
 
         let hasMatch = false;
         let lastIndex = 0;
         let replaced = "";
         let simpleReplaced = "";
-        let imageReplaced = "";
+        let uploadReplaced = "";
 
         for (const match of matches) {
             const fullMatch = match[0];
@@ -113,46 +181,66 @@ export default definePlugin({
 
             replaced += plainText;
             simpleReplaced += plainText;
-            imageReplaced += plainText;
+            uploadReplaced += plainText;
 
             let detailedReplacement = fullMatch;
             let simpleReplacement = fullMatch;
+            let uploadReplacement = fullMatch;
 
             try {
-                // Try unit conversion first (e.g. "5 km to miles")
-                const conversion = tryConvertUnits(rawExpr);
-                if (conversion) {
+                const graphCall = getGraphCall(rawExpr);
+                if (graphCall) {
+                    const domain = resolveGraphDomain(graphCall.domain, evalState);
+                    graphs.push({
+                        label: graphCall.expression,
+                        color: getGraphColor(graphs.length),
+                        points: sampleGraphExpression(resolveExpr(graphCall.expression), evalState, domain),
+                    });
+                    graphDomains.push([domain[0], domain[1]]);
                     hasMatch = true;
-                    detailedReplacement = conversion;
-                    simpleReplacement = conversion;
+                    uploadReplacement = "";
                 } else {
-                    const expr = resolveExpr(rawExpr);
-                    const { statementKind, simpleText, detailedText } = evaluateExpressionWithOutputs(expr, evalState);
-                    hasMatch = true;
-
-                    if (statementKind === "function_def") {
-                        detailedReplacement = "";
-                        simpleReplacement = "";
-                    } else if (settings.store.imageOutput) {
-                        exprs.push({
-                            raw: rawExpr,
-                            detailed: settings.store.showSteps ? detailedText : undefined,
-                            simple: simpleText,
-                        });
-                        detailedReplacement = simpleText;
-                        simpleReplacement = simpleText;
+                    // Try unit conversion first (e.g. "5 km to miles")
+                    const conversion = tryConvertUnits(rawExpr);
+                    if (conversion) {
+                        hasMatch = true;
+                        detailedReplacement = conversion;
+                        simpleReplacement = conversion;
+                        uploadReplacement = conversion;
                     } else {
-                        detailedReplacement = settings.store.showSteps ? detailedText : simpleText;
-                        simpleReplacement = simpleText;
+                        const expr = resolveExpr(rawExpr);
+                        const { statementKind, simpleText, detailedText } = evaluateExpressionWithOutputs(expr, evalState);
+                        hasMatch = true;
+
+                        if (statementKind === "function_def") {
+                            detailedReplacement = "";
+                            simpleReplacement = "";
+                            uploadReplacement = "";
+                        } else if (settings.store.imageOutput && !hasGraphCall) {
+                            exprs.push({
+                                raw: rawExpr,
+                                detailed: settings.store.showSteps ? detailedText : undefined,
+                                simple: simpleText,
+                            });
+                            detailedReplacement = simpleText;
+                            simpleReplacement = simpleText;
+                            uploadReplacement = "";
+                        } else {
+                            detailedReplacement = settings.store.showSteps ? detailedText : simpleText;
+                            simpleReplacement = simpleText;
+                            uploadReplacement = detailedReplacement;
+                        }
                     }
                 }
             } catch {
                 detailedReplacement = fullMatch;
                 simpleReplacement = fullMatch;
+                uploadReplacement = fullMatch;
             }
 
             replaced += detailedReplacement;
             simpleReplaced += simpleReplacement;
+            uploadReplaced += uploadReplacement;
             lastIndex = matchIndex + fullMatch.length;
         }
 
@@ -160,12 +248,37 @@ export default definePlugin({
 
         replaced += msg.content.slice(lastIndex);
         simpleReplaced += msg.content.slice(lastIndex);
-        imageReplaced += msg.content.slice(lastIndex);
+        uploadReplaced += msg.content.slice(lastIndex);
 
         // Image output mode: send text normally, then prompt image upload
         const channel = canUploadInChannel(channelId);
+        if (graphs.length > 0 && channel) {
+            const canvas = renderGraphToCanvas(graphs, {
+                text: settings.store.textColor,
+                operator: settings.store.operatorColor,
+                equals: settings.store.equalsColor
+            }, resolveCombinedGraphDomain(graphDomains));
+
+            canvasToBlob(canvas).then(blob => {
+                const file = new File([blob], "graph.png", { type: "image/png" });
+                UploadHandler.promptToUpload([file], channel, DraftType.ChannelMessage);
+            }).catch(() => {
+                showToast("[InlineMath] Failed to render graph image.", Toasts.Type.FAILURE);
+            });
+
+            ComponentDispatch.dispatchToLastSubscribed("CLEAR_TEXT");
+            setTimeout(() => {
+                ComponentDispatch.dispatchToLastSubscribed("INSERT_TEXT", {
+                    rawText: uploadReplaced,
+                    plainText: uploadReplaced
+                });
+            }, 50);
+
+            return { cancel: true };
+        }
+
         if (settings.store.imageOutput && exprs.length > 0 && channel) {
-            replaced = imageReplaced;
+            replaced = uploadReplaced;
 
             const imageLines = exprs.map(e => {
                 if (e.detailed) return e.detailed.replace(/\s*;\s*/g, "\n");

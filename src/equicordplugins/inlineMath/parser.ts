@@ -7,6 +7,8 @@
 // ── Token types ──────────────────────────────────────────────
 
 const MAX_REDUCTION_STEPS = 100;
+const GRAPH_SAMPLE_COUNT = 160;
+const MAX_GRAPH_MAGNITUDE = 10000;
 
 const enum TokenType {
     Number,
@@ -413,6 +415,11 @@ export interface EvaluationState {
     funcs: Record<string, UserFunction>;
 }
 
+export interface GraphPoint {
+    x: number;
+    y: number | null;
+}
+
 export type StatementKind = StatementNode["kind"];
 
 interface EvalContext {
@@ -701,6 +708,13 @@ export function evaluateExpression(expression: string, state: EvaluationState): 
     return evaluateProgram(program, state);
 }
 
+export function evaluateDetachedExpression(expression: string, state: EvaluationState): { result: number; statementKind: StatementKind; } {
+    const tokens = tokenize(expression);
+    const parser = new Parser(tokens);
+    const program = parser.parse();
+    return evaluateProgram(program, cloneEvaluationState(state));
+}
+
 export function evaluateExpressionWithOutputs(expression: string, state: EvaluationState): {
     result: number;
     statementKind: StatementKind;
@@ -743,6 +757,41 @@ export function evaluateExpressionWithOutputs(expression: string, state: Evaluat
         simpleText,
         detailedText: steps.join(" = "),
     };
+}
+
+export function sampleGraphExpression(expression: string, state: EvaluationState, domain: readonly [number, number] = [-10, 10]): GraphPoint[] {
+    const tokens = tokenize(expression);
+    const parser = new Parser(tokens);
+    const program = parser.parse();
+
+    if (program.statements.length !== 1 || program.statements[0].kind !== "expr_stmt")
+        throw new Error("Graph expressions must contain a single expression");
+
+    const [minX, maxX] = domain;
+    if (maxX <= minX)
+        throw new Error("Graph domain is invalid");
+
+    const step = (maxX - minX) / GRAPH_SAMPLE_COUNT;
+    const [{ expr }] = program.statements;
+
+    return Array.from({ length: GRAPH_SAMPLE_COUNT + 1 }, (_, index) => {
+        const x = minX + step * index;
+
+        try {
+            const y = evaluate(expr, {
+                vars: { ...state.vars, x },
+                funcs: state.funcs,
+                callDepth: 0,
+            });
+
+            return {
+                x,
+                y: Number.isFinite(y) && !Number.isNaN(y) && Math.abs(y) <= MAX_GRAPH_MAGNITUDE ? y : null,
+            };
+        } catch {
+            return { x, y: null };
+        }
+    });
 }
 
 export function formatResult(result: number): string {
